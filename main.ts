@@ -1,846 +1,590 @@
-/**
- * pumpfun-top5-forecast-01 — v3 Two-Channel Monte Carlo with Calibration Layer
- * Node standard library only, TypeScript, fully deterministic.
- */
+import { readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 
-import * as fs from 'fs';
-import * as path from 'path';
-import * as readline from 'readline';
+// ==========================================
+// TUNABLE CONSTANTS
+// ==========================================
+const DRAWS = 8000;
+const SEED = 424242;
+const EMIT_MIN_P = 0.008;
+const MAX_ROWS_PER_PLACE = 24;
+const EMIT_MIN_SIZE_P = 0.002;
+const DRIFT_TAU_H = 3.0;
+const TREND_MAX_WEIGHT = 0.3;
+const TREND_SLOPE_CAP = 0.4;
+const SIGMA_FLOOR = 0.08;
+const CURVE_MULT = 1.4;
+const STALE_MULT = 1.5;
+const TOP5_INCUMBENT_BONUS = 0.06;
+const TOP5_RANK_SHRINK = 0.4;
+const MICRO = 1_000_000;
 
-// --- Seeded PRNG (Mulberry32) ---
+const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
+const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+
+// ==========================================
+// SEEDED RNG & STATISTICAL HELPERS
+// ==========================================
 class Mulberry32 {
   private s: number;
   constructor(seed: number) {
-    this.s = seed | 0;
+    this.s = seed >>> 0;
   }
   next(): number {
-    this.s = (this.s + 0x6d2b79f5) | 0;
-    let t = Math.imul(this.s ^ (this.s >>> 15), 1 | this.s);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    let z = (this.s += 0x6d2b79f5);
+    z = Math.imul(z ^ (z >>> 15), z | 1);
+    z ^= z + Math.imul(z ^ (z >>> 7), z | 61);
+    return ((z ^ (z >>> 14)) >>> 0) / 4294967296;
   }
 }
 
-// --- Statistical Helpers ---
+function createRng(seed: number) {
+  const rng = new Mulberry32(seed);
+  return {
+    uniform: () => rng.next(),
+    normal: (mean = 0, sd = 1) => {
+      let u = 0, v = 0;
+      while (u === 0) u = rng.next();
+      while (v === 0) v = rng.next();
+      const z = Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+      return mean + z * sd;
+    },
+    poisson: (lam: number) => {
+      if (lam <= 0) return 0;
+      if (lam < 30) {
+        let L = Math.exp(-lam);
+        let k = 0;
+        let p = 1;
+        do {
+          k++;
+          p *= rng.next();
+        } while (p > L);
+        return k - 1;
+      }
+      const z = rng.normal(0, 1);
+      return Math.max(0, Math.round(lam + Math.sqrt(lam) * z));
+    }
+  };
+}
+
+/** erfc(x), Numerical Recipes' erfcc (fractional error under 1.2e-7 everywhere). */
+function erfc(x: number): number {
+  const z = Math.abs(x);
+  const t = 1 / (1 + 0.5 * z);
+  const r = t * Math.exp(-z * z - 1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 + t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))));
+  return x >= 0 ? r : 2 - r;
+}
+const above = (x: number, mean: number, sd: number): number => (x === -Infinity ? 1 : x === Infinity ? 0 : 0.5 * erfc((x - mean) / (sd * Math.SQRT2)));
+
 function median(arr: number[]): number {
   if (arr.length === 0) return 0;
   const sorted = [...arr].sort((a, b) => a - b);
   const mid = Math.floor(sorted.length / 2);
-  if (sorted.length % 2 === 0) {
-    return (sorted[mid - 1] + sorted[mid]) / 2;
-  }
-  return sorted[mid];
+  return sorted.length % 2 !== 0 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
 }
 
 function robustStd(arr: number[]): number {
   if (arr.length === 0) return 0.35;
   const med = median(arr);
-  const absDevs = arr.map(x => Math.abs(x - med));
+  const absDevs = arr.map((x) => Math.abs(x - med));
   const mad = median(absDevs);
-  if (mad === 0) return 0.35;
-  return 1.4826 * mad;
+  const sd = 1.4826 * mad;
+  return Number.isFinite(sd) && sd > 0 ? sd : 0.35;
 }
 
 function clamp(val: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, val));
 }
 
-// Box-Muller normal sample
-function randomNormal(rng: Mulberry32, mean = 0, std = 1): number {
-  let u = 0, v = 0;
-  while (u === 0) u = rng.next();
-  while (v === 0) v = rng.next();
-  const num = Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
-  return mean + num * std;
-}
-
-// Poisson sample (Knuth for lambda < 30, else normal approx)
-function randomPoisson(rng: Mulberry32, lambda: number): number {
-  if (lambda <= 0) return 0;
-  if (lambda < 30) {
-    let L = Math.exp(-lambda);
-    let k = 0;
-    let p = 1;
-    do {
-      k++;
-      p *= rng.next();
-    } while (p > L);
-    return k - 1;
-  } else {
-    const val = Math.round(randomNormal(rng, lambda, Math.sqrt(lambda)));
-    return Math.max(0, val);
-  }
-}
-
-// Erfc / Normal CDF for size bins in fallback
-function normalCDF(x: number, mean: number, std: number): number {
-  const z = (x - mean) / (std * Math.sqrt(2));
-  const t = 1.0 / (1.0 + 0.5 * Math.abs(z));
-  const tau =
-    t *
-    Math.exp(
-      -z * z -
-        1.26551223 +
-        t *
-          (1.00002368 +
-            t *
-              (0.37409196 +
-                t *
-                  (0.09678418 +
-                    t *
-                      (-0.18628806 +
-                        t *
-                          (0.27886807 +
-                            t *
-                              (-1.13520398 +
-                                t *
-                                  (1.48851587 +
-                                    t * (-0.82215223 + t * 0.17087277))))))))
-    );
-  return z >= 0 ? 1.0 - 0.5 * tau : 0.5 * tau;
-}
-
-// OLS slope of y on x
-function olsSlope(xs: number[], ys: number[]): number {
-  const n = xs.length;
-  if (n < 2) return 0;
-  let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
-  for (let i = 0; i < n; i++) {
-    sumX += xs[i];
-    sumY += ys[i];
-    sumXY += xs[i] * ys[i];
-    sumX2 += xs[i] * xs[i];
-  }
-  const denom = n * sumX2 - sumX * sumX;
-  if (Math.abs(denom) < 1e-9) return 0;
-  return (n * sumXY - sumX * sumY) / denom;
-}
-
-// --- Data Types ---
-interface Task {
-  t0: string;
-  reads: string[];
-  places: number;
-  chart_size: number;
-  output: string;
-  size: { edges: number[] };
-}
-
-interface ChartRow {
-  mint: string;
+// ==========================================
+// TYPES
+// ==========================================
+interface Row {
   rank: number;
-  name?: string;
-  symbol?: string;
-  bonding_curve?: string;
-  pool?: string;
-  lamports?: string;
-  market_cap_lamports?: string;
+  mint: string;
+  market_cap_lamports: string | number;
+  venue?: string;
+  complete?: boolean;
 }
 
 interface Mark {
-  time: string;
+  at: string;
+  ok: boolean;
+  rows: Row[];
   timeHours: number;
-  rows: ChartRow[];
 }
 
-interface ForecastRow {
-  place: number;
-  mint: string;
-  p: number;
-}
+// ==========================================
+// FALLBACK EXECUTOR
+// ==========================================
+function writePersistenceFallback(task: any, marks: Mark[]) {
+  const lastMark = marks[marks.length - 1];
+  const chart = [...lastMark.rows].sort((a, b) => a.rank - b.rank);
+  const sizeOf = (lamports: string | number): number => Math.log10(Number(BigInt(lamports))) - 9;
+  
+  const probabilities: Array<{ mint: string; place: number; p: number }> = [];
+  const sizes: Array<{ place: number; bin: number; p: number }> = [];
+  const edges = task.size.edges;
 
-interface SizeRow {
-  place: number;
-  bin: number;
-  p: number;
-}
+  for (let place = 1; place <= task.places; place++) {
+    if (chart[place - 1]) probabilities.push({ mint: chart[place - 1].mint, place, p: 0.3 });
+    if (place > 1 && chart[place - 2]) probabilities.push({ mint: chart[place - 2].mint, place, p: 0.1 });
+    if (chart[place]) probabilities.push({ mint: chart[place].mint, place, p: 0.1 });
 
-interface ForecastOutput {
-  probabilities: ForecastRow[];
-  sizes: SizeRow[];
-  top5: string[];
-}
-
-// --- Main Execution ---
-async function main() {
-  const inputDir = process.env.MAKEFUN_INPUT_DIR || 'input';
-  const outputDir = process.env.MAKEFUN_OUTPUT_DIR || 'out';
-
-  const taskPath = path.join(inputDir, 'task.json');
-  const historyPath = path.join(inputDir, 'history.ndjson');
-
-  let task: Task;
-  let marks: Mark[] = [];
-
-  try {
-    const taskContent = fs.readFileSync(taskPath, 'utf-8');
-    task = JSON.parse(taskContent);
-
-    const t0Date = new Date(task.t0).getTime();
-
-    const fileStream = fs.createReadStream(historyPath);
-    const rl = readline.createInterface({
-      input: fileStream,
-      crlfDelay: Infinity,
-    });
-
-    for await (const line of rl) {
-      if (!line.trim()) continue;
-      try {
-        const obj = JSON.parse(line);
-        if (obj.ok && obj.rows && Array.isArray(obj.rows)) {
-          const timeStr = obj.time !== undefined ? obj.time : obj.at;
-          const timeHours = (new Date(timeStr).getTime() - t0Date) / 3600000;
-          // Sort rows by rank ascending
-          const rows: ChartRow[] = obj.rows.sort((a: ChartRow, b: ChartRow) => a.rank - b.rank);
-          marks.push({ time: timeStr, timeHours, rows });
-        }
-      } catch (e) {
-        // Ignore malformed lines
+    if (chart[place - 1]) {
+      const mean = sizeOf(chart[place - 1].market_cap_lamports);
+      for (let bin = 0; bin <= edges.length; bin++) {
+        const lo = bin === 0 ? -Infinity : edges[bin - 1];
+        const hi = bin === edges.length ? Infinity : edges[bin];
+        const u = Math.floor((above(lo, mean, 0.35) - above(hi, mean, 0.35)) * MICRO);
+        if (u > 0) sizes.push({ place, bin, p: u / MICRO });
       }
     }
-  } catch (err) {
-    emitFallback(task!, marks, outputDir);
-    return;
+  }
+  const top5 = chart.slice(0, task.places).map((r) => r.mint);
+  writeFileSync(join(OUTPUT_DIR, task.output), `${JSON.stringify({ probabilities, top5, sizes })}\n`);
+}
+
+// ==========================================
+// MAIN MODEL
+// ==========================================
+function main() {
+  const task = JSON.parse(readFileSync(join(INPUT_DIR, 'task.json'), 'utf8')) as {
+    t0: string;
+    reads: string[];
+    places: number;
+    chart_size: number;
+    output: string;
+    size: { edges: number[] };
+  };
+
+  const lines = readFileSync(join(INPUT_DIR, 'history.ndjson'), 'utf8').split('\n').filter((l) => l.trim() !== '');
+  const t0Time = new Date(task.t0).getTime();
+
+  const marks: Mark[] = [];
+  for (const line of lines) {
+    try {
+      const m = JSON.parse(line);
+      if (m.ok && Array.isArray(m.rows)) {
+        const atTime = new Date(m.at).getTime();
+        const timeHours = (atTime - t0Time) / 3600000;
+        const sortedRows = [...m.rows].sort((a, b) => a.rank - b.rank);
+        marks.push({ at: m.at, ok: true, rows: sortedRows, timeHours });
+      }
+    } catch {}
   }
 
-  // Sort marks by time hours
-  marks.sort((a, b) => a.timeHours - b.timeHours);
-
-  if (marks.length < 2 || !marks[marks.length - 1].rows || marks[marks.length - 1].rows.length < 5) {
-    emitFallback(task, marks, outputDir);
+  if (marks.length < 2) {
+    writePersistenceFallback(task, marks);
     return;
   }
 
   const lastMark = marks[marks.length - 1];
-
-  // Helper to get size in log10 lamports - 9
-  function sizeOf(val: string | undefined): number {
-    if (!val) return 0;
-    try {
-      const bi = BigInt(val);
-      if (bi <= 0n) return 0;
-      return Number(Math.log10(Number(bi))) - 9;
-    } catch (e) {
-      const num = Number(val);
-      return isNaN(num) || num <= 0 ? 0 : Math.log10(num) - 9;
-    }
+  if (!lastMark || lastMark.rows.length < task.places) {
+    writePersistenceFallback(task, marks);
+    return;
   }
 
-  function getRowSize(r: ChartRow): number {
-    return sizeOf(r.lamports !== undefined ? r.lamports : r.market_cap_lamports);
-  }
+  const sizeOf = (lamports: string | number): number => Math.log10(Number(BigInt(lamports))) - 9;
 
-  // --- Pair Statistics over all ordered mark pairs (a before b), gapH > 0 ---
-  const allIncrements: number[] = [];
-  const bandPools: { [band: string]: number[] } = { '1-10': [], '11-30': [], '31-100': [] };
-  const venuePools: { [venue: string]: number[] } = { pool: [], nonPool: [] };
-
-  const leaderPairMedians: number[] = [];
-  const marketPoints: number[] = [];
-  const thresholdDriftsByPlace: { [k: number]: number[] } = { 1: [], 2: [], 3: [], 4: [], 5: [] };
-  const outsiderSharePoints: { h: number; share: number }[] = [];
-  const entrantOffsetsList: number[] = [];
+  // 1. Pair Statistics over ALL ordered pairs (a before b)
+  const normIncrements: number[] = [];
+  const bandInc1_10: number[] = [];
+  const bandInc11_30: number[] = [];
+  const bandInc31_100: number[] = [];
+  const venuePoolInc: number[] = [];
+  const venueCurveInc: number[] = [];
+  const leaderMedianRates: number[] = [];
+  const marketSigmaPoints: number[] = [];
+  const thresholdDrifts: number[][] = Array.from({ length: task.places + 1 }, () => []);
+  const outsiderSharePoints: Array<{ gapH: number; share: number }> = [];
+  const entrantOffsets: number[] = [];
 
   for (let i = 0; i < marks.length; i++) {
     for (let j = i + 1; j < marks.length; j++) {
-      const ma = marks[i];
-      const mb = marks[j];
+      const ma = marks[i]!;
+      const mb = marks[j]!;
       const gapH = mb.timeHours - ma.timeHours;
       if (gapH <= 0) continue;
       const sqrtGap = Math.sqrt(gapH);
 
-      const mapA = new Map<string, { size: number; rank: number; venue: string }>();
+      const mapA = new Map<string, Row>();
+      for (const r of ma.rows) mapA.set(r.mint, r);
+      const mapB = new Map<string, Row>();
+      for (const r of mb.rows) mapB.set(r.mint, r);
+
+      // Top 30 set at a
+      const top30MintsA = new Set<string>();
       for (const r of ma.rows) {
-        const venue = r.pool ? 'pool' : 'nonPool';
-        mapA.set(r.mint, { size: getRowSize(r), rank: r.rank, venue });
+        if (r.rank <= 30) top30MintsA.add(r.mint);
       }
 
-      const mapB = new Map<string, { size: number; rank: number }>();
-      for (const r of mb.rows) {
-        mapB.set(r.mint, { size: getRowSize(r), rank: r.rank });
-      }
-
-      // Increments for coins in both with rank at a <= 100
-      const pairIncs: number[] = [];
-      for (const [mint, infoA] of mapA.entries()) {
-        if (infoA.rank <= 100 && mapB.has(mint)) {
-          const infoB = mapB.get(mint)!;
-          const d = infoB.size - infoA.size;
+      const pairIncrementsTop30: number[] = [];
+      for (const rB of mb.rows) {
+        const rA = mapA.get(rB.mint);
+        if (rA && rA.rank <= 100) {
+          const szA = sizeOf(rA.market_cap_lamports);
+          const szB = sizeOf(rB.market_cap_lamports);
+          const d = szB - szA;
           const nd = d / sqrtGap;
-          allIncrements.push(nd);
-          pairIncs.push(d);
+          normIncrements.push(nd);
 
-          if (infoA.rank <= 10) bandPools['1-10'].push(nd);
-          else if (infoA.rank <= 30) bandPools['11-30'].push(nd);
-          else bandPools['31-100'].push(nd);
+          if (rA.rank <= 10) bandInc1_10.push(nd);
+          else if (rA.rank <= 30) bandInc11_30.push(nd);
+          else bandInc31_100.push(nd);
 
-          if (infoA.venue === 'pool') venuePools.pool.push(nd);
-          else venuePools.nonPool.push(nd);
-        }
-      }
+          const venue = rA.venue ?? 'curve';
+          if (venue === 'pool') venuePoolInc.push(nd);
+          else venueCurveInc.push(nd);
 
-      // Leader drift per pair: median of (d / gapH) over coins ranked <= 30 at a
-      const leaderIncs: number[] = [];
-      for (const [mint, infoA] of mapA.entries()) {
-        if (infoA.rank <= 30 && mapB.has(mint)) {
-          const infoB = mapB.get(mint)!;
-          leaderIncs.push((infoB.size - infoA.size) / gapH);
-        }
-      }
-      if (leaderIncs.length > 0) {
-        const medL = median(leaderIncs);
-        leaderPairMedians.push(medL);
-      }
-
-      // Market point per pair = pairMedian * sqrt(gapH)
-      if (pairIncs.length > 0) {
-        marketPoints.push(median(pairIncs));
-      }
-
-      // Place-threshold drift per place k: median over pairs of (size of place k at b - size of place k at a) / gapH
-      for (let k = 1; k <= 5; k++) {
-        const rA = ma.rows.find(r => r.rank === k);
-        const rB = mb.rows.find(r => r.rank === k);
-        if (rA && rB) {
-          const drift = (getRowSize(rB) - getRowSize(rA)) / gapH;
-          thresholdDriftsByPlace[k].push(drift);
-        }
-      }
-
-      // Outsider share: fraction of b's top-5 coins that are NOT in a's top-30
-      const top30A = new Set(ma.rows.filter(r => r.rank <= 30).map(r => r.mint));
-      const top5B = mb.rows.filter(r => r.rank <= 5);
-      if (top5B.length > 0) {
-        const outsiders = top5B.filter(r => !top30A.has(r.mint)).length;
-        const share = outsiders / top5B.length;
-        outsiderSharePoints.push({ h: gapH, share });
-      }
-
-      // Entrant offsets: for each of b's top-5 coins not in a's top-30, offset = its size - size of place 5 at b
-      const place5B = mb.rows.find(r => r.rank === 5);
-      const size5B = place5B ? getRowSize(place5B) : 0;
-      if (place5B) {
-        for (const rB of top5B) {
-          if (!top30A.has(rB.mint)) {
-            entrantOffsetsList.push(getRowSize(rB) - size5B);
+          if (rA.rank <= 30) {
+            pairIncrementsTop30.push(d / gapH);
           }
         }
       }
+
+      if (pairIncrementsTop30.length > 0) {
+        const medRate = median(pairIncrementsTop30);
+        leaderMedianRates.push(medRate);
+        marketSigmaPoints.push(medRate * sqrtGap); // approximate per sqrt-hour
+      }
+
+      // Place threshold drift
+      for (let k = 1; k <= task.places; k++) {
+        const rowAk = ma.rows[k - 1];
+        const rowBk = mb.rows[k - 1];
+        if (rowAk && rowBk) {
+          const szAk = sizeOf(rowAk.market_cap_lamports);
+          const szBk = sizeOf(rowBk.market_cap_lamports);
+          thresholdDrifts[k]!.push((szBk - szAk) / gapH);
+        }
+      }
+
+      // Outsider share in top 5 at b
+      let top5Outsiders = 0;
+      const top5B = mb.rows.slice(0, 5);
+      for (const rB of top5B) {
+        if (!top30MintsA.has(rB.mint)) {
+          top5Outsiders++;
+        }
+      }
+      const share = top5B.length > 0 ? top5Outsiders / top5B.length : 0;
+      outsiderSharePoints.push({ gapH, share });
+
+      // Entrant offsets
+      const place5Bk = mb.rows[4];
+      const sz5B = place5Bk ? sizeOf(place5Bk.market_cap_lamports) : 0;
+      for (const rB of top5B) {
+        if (!top30MintsA.has(rB.mint)) {
+          const szB = sizeOf(rB.market_cap_lamports);
+          entrantOffsets.push(szB - sz5B);
+        }
+      }
     }
   }
 
-  const baseSigma = robustStd(allIncrements);
+  const baseSigma = robustStd(normIncrements);
+  const sd1_10 = robustStd(bandInc1_10);
+  const sd11_30 = robustStd(bandInc11_30);
+  const sd31_100 = robustStd(bandInc31_100);
 
-  function bandMult(rank: number): number {
-    let key = '31-100';
-    if (rank <= 10) key = '1-10';
-    else if (rank <= 30) key = '11-30';
-    const pool = bandPools[key];
-    if (pool.length >= 20) {
-      const sdBand = robustStd(pool);
-      return clamp(sdBand / baseSigma, 0.7, 1.8);
-    }
-    return 1.0;
+  const bandMult = (rank: number): number => {
+    if (rank <= 10) return clamp(bandInc1_10.length >= 20 ? sd1_10 / baseSigma : 1.0, 0.7, 1.8);
+    if (rank <= 30) return clamp(bandInc11_30.length >= 20 ? sd11_30 / baseSigma : 1.0, 0.7, 1.8);
+    return clamp(bandInc31_100.length >= 20 ? sd31_100 / baseSigma : 1.0, 0.7, 1.8);
+  };
+
+  const sdPool = robustStd(venuePoolInc);
+  const sdCurve = robustStd(venueCurveInc);
+  const venueMult = clamp(venuePoolInc.length >= 20 && venueCurveInc.length >= 20 ? sdCurve / sdPool : 1.0, 0.7, 1.6);
+
+  let g = median(leaderMedianRates) * 0.5;
+  g = clamp(g, -0.1, 0.1);
+
+  const placeDrift: number[] = [];
+  for (let k = 1; k <= task.places; k++) {
+    placeDrift[k] = clamp(median(thresholdDrifts[k]!), -0.1, 0.15);
   }
 
-  const poolVen = venuePools.pool;
-  const nonPoolVen = venuePools.nonPool;
-  let venueMultVal = 1.0;
-  if (poolVen.length >= 20 && nonPoolVen.length >= 20) {
-    const sdPool = robustStd(poolVen);
-    const sdNonPool = robustStd(nonPoolVen);
-    venueMultVal = clamp(sdNonPool / (sdPool === 0 ? 0.35 : sdPool), 0.7, 1.6);
-  }
-
-  const rawG = leaderPairMedians.length > 0 ? median(leaderPairMedians) : 0;
-  const g = clamp(0.5 * rawG, -0.1, 0.1);
-  const sigmaM = clamp(robustStd(marketPoints), 0.02, 0.5);
-
-  const placeDrift: { [k: number]: number } = {};
-  for (let k = 1; k <= 5; k++) {
-    placeDrift[k] = clamp(median(thresholdDriftsByPlace[k]), -0.1, 0.15);
-  }
-
-  // Fit outsider share share(h) = Sinf * (1 - exp(-h/tau)) by grid search
-  const sinfGrid = [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95];
-  const tauGrid = [0.25, 0.5, 1, 2, 3, 4, 6, 8, 12];
+  // Fit outsider share share(h) = Sinf * (1 - exp(-h / tau))
   let bestSinf = 0.5;
   let bestTau = 2.0;
   let bestErr = Infinity;
+  const sinfGrid = [0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95];
+  const tauGrid = [0.25, 0.5, 1, 2, 3, 4, 6, 8, 12];
 
-  for (const sinf of sinfGrid) {
+  for (const Sinf of sinfGrid) {
     for (const tau of tauGrid) {
       let err = 0;
       for (const pt of outsiderSharePoints) {
-        const pred = sinf * (1 - Math.exp(-pt.h / tau));
+        const pred = Sinf * (1 - Math.exp(-pt.gapH / tau));
         const diff = pred - pt.share;
         err += diff * diff;
       }
       if (err < bestErr) {
         bestErr = err;
-        bestSinf = sinf;
+        bestSinf = Sinf;
         bestTau = tau;
       }
     }
   }
+  const fitShare = (h: number) => bestSinf * (1 - Math.exp(-h / bestTau));
 
-  function fitShare(h: number): number {
-    return bestSinf * (1 - Math.exp(-h / bestTau));
-  }
+  const entrantOffsetMean = median(entrantOffsets);
+  const entrantOffsetSd = clamp(robustStd(entrantOffsets), 0.1, 0.8);
 
-  const entrantOffsetMean = entrantOffsetsList.length > 0 ? median(entrantOffsetsList) : 0;
-  const entrantOffsetSd = clamp(robustStd(entrantOffsetsList), 0.1, 0.8);
+  const sigmaM = clamp(robustStd(marketSigmaPoints), 0.02, 0.5);
 
-  // --- Candidates Extraction ---
-  // Every mint in the last mark, plus every mint ranked <= 30 in either of the two marks before the last.
-  const candidateMints = new Set<string>();
-  for (const r of lastMark.rows) {
-    candidateMints.add(r.mint);
-  }
-  const prevMarks = marks.slice(-3, -1);
-  for (const pm of prevMarks) {
-    for (const r of pm.rows) {
-      if (r.rank <= 30) {
-        candidateMints.add(r.mint);
-      }
-    }
-  }
-
-  interface CandidateInfo {
+  // 2. Candidates
+  const candidateMap = new Map<string, {
     mint: string;
     lastSize: number;
     lastRank: number;
     venue: string;
+    complete: boolean;
+    obs: Array<{ timeHours: number; size: number }>;
     inLastMark: boolean;
-    trend: number;
-    sigma_i: number;
-  }
+  }>();
 
-  const candidates: CandidateInfo[] = [];
-
-  for (const mint of candidateMints) {
-    // Collect all observations for this mint across all marks
-    const obs: { t: number; size: number }[] = [];
-    let lastSize = 0;
-    let lastRank = 999;
-    let venue = 'nonPool';
-    let inLastMark = false;
-
-    for (const m of marks) {
-      const row = m.rows.find(r => r.mint === mint);
-      if (row) {
-        const sz = getRowSize(row);
-        obs.push({ t: m.timeHours, size: sz });
-        if (m === lastMark) {
-          inLastMark = true;
-          lastSize = sz;
-          lastRank = row.rank;
-          venue = row.pool ? 'pool' : 'nonPool';
-        } else if (!inLastMark) {
-          lastSize = sz;
-          lastRank = row.rank;
-          venue = row.pool ? 'pool' : 'nonPool';
-        }
-      }
-    }
-
-    // Trend: OLS slope of size on time over observations, clamped to [-0.4, 0.4] (0 if < 2 obs)
-    let trend = 0;
-    if (obs.length >= 2) {
-      const xs = obs.map(o => o.t);
-      const ys = obs.map(o => o.size);
-      trend = clamp(olsSlope(xs, ys), -0.4, 0.4);
-    }
-    const nObs = obs.length;
-    const trendWeight = Math.min(0.3, nObs / (nObs + 8));
-    const effectiveTrend = trend * trendWeight;
-
-    // sigma_i = max(0.08, baseSigma * bandMult(lastRank) * venueMult * (venue !== 'pool' ? 1.4 : 1) * (inLastMark ? 1 : 1.5))
-    const bMult = bandMult(lastRank);
-    const vMult = venue !== 'pool' ? 1.4 : 1.0;
-    const markMult = inLastMark ? 1.0 : 1.5;
-    const sigma_i = Math.max(0.08, baseSigma * bMult * venueMultVal * vMult * markMult);
-
-    candidates.push({
-      mint,
-      lastSize,
-      lastRank,
-      venue,
-      inLastMark,
-      trend: effectiveTrend,
-      sigma_i,
+  // Add all mints from last mark
+  for (const r of lastMark.rows) {
+    candidateMap.set(r.mint, {
+      mint: r.mint,
+      lastSize: sizeOf(r.market_cap_lamports),
+      lastRank: r.rank,
+      venue: r.venue ?? 'curve',
+      complete: r.complete ?? false,
+      obs: [{ timeHours: lastMark.timeHours, size: sizeOf(r.market_cap_lamports) }],
+      inLastMark: true
     });
+  }
+
+  // Add mints ranked <= 30 in either of the two marks before last
+  const recentMarks = marks.slice(Math.max(0, marks.length - 3), marks.length - 1);
+  for (const m of recentMarks) {
+    for (const r of m.rows) {
+      if (r.rank <= 30) {
+        let cand = candidateMap.get(r.mint);
+        if (!cand) {
+          cand = {
+            mint: r.mint,
+            lastSize: sizeOf(r.market_cap_lamports),
+            lastRank: r.rank,
+            venue: r.venue ?? 'curve',
+            complete: r.complete ?? false,
+            obs: [],
+            inLastMark: false
+          };
+          candidateMap.set(r.mint, cand);
+        }
+        cand.obs.push({ timeHours: m.timeHours, size: sizeOf(r.market_cap_lamports) });
+      }
     }
+  }
 
-    const lastPlace5Row = lastMark.rows.find(r => r.rank === 5);
-    const lastPlace5Size = lastPlace5Row ? getRowSize(lastPlace5Row) : 0;
-
-  // --- Simulation ---
-  const readHours = task.reads.map((r) => (new Date(r).getTime() - new Date(task.t0).getTime()) / 3600000);
-  const rng = new Mulberry32(424242);
-  const DRAWS = 8000;
-  const numReads = readHours.length;
-  const totalDraws = numReads * DRAWS;
-
-  // Aggregators for raw probabilities and sizes
-  // winCounts[place][mint] = count
-  // top5Counts[mint] = count
-  // sizeBinCounts[place][binIndex] = count
-  const winCounts: { [place: number]: Map<string, number> } = { 1: new Map(), 2: new Map(), 3: new Map(), 4: new Map(), 5: new Map() };
-  const top5Counts = new Map<string, number>();
-  const sizeBinCounts: { [place: number]: { [bin: number]: number } } = {
-    1: {}, 2: {}, 3: {}, 4: {}, 5: {},
-  };
-  const sizeEdges = task.size.edges;
-
-  for (const rh of readHours) {
-    const h = Math.max(0.05, rh - lastMark.timeHours);
-    const hEff = 3 * (1 - Math.exp(-h / 3));
-    const share = fitShare(h);
-    const lambda = Math.min(8, (5 * share) / Math.max(0.05, 1 - share));
-    const sqrtH = Math.sqrt(h);
-
-    for (let d = 0; d < DRAWS; d++) {
-      // Shared market shock
-      const marketShock = randomNormal(rng, 0, sigmaM * sqrtH);
-
-      // Simulate candidate sizes
-      interface SimCoin {
-        mint: string;
-        size: number;
-        isReal: boolean;
-      }
-
-      const simCoins: SimCoin[] = [];
-      for (const cand of candidates) {
-        const eps = randomNormal(rng, 0, cand.sigma_i * sqrtH);
-        const simSize = cand.lastSize + g * hEff + cand.trend * hEff + marketShock + eps;
-        simCoins.push({ mint: cand.mint, size: simSize, isReal: true });
-      }
-
-      // Phantom newcomers
-      const phantomCount = randomPoisson(rng, lambda);
-      for (let p = 0; p < phantomCount; p++) {
-        const pSize = lastPlace5Size + (placeDrift[5] || 0) * hEff + randomNormal(rng, entrantOffsetMean, entrantOffsetSd);
-        simCoins.push({ mint: `__phantom_${d}_${p}`, size: pSize, isReal: false });
-      }
-
-      // Sort by size descending
-      simCoins.sort((a, b) => b.size - a.size);
-
-      // Record top 5
-      const top5ThisDraw = new Set<string>();
-      for (let rank = 1; rank <= 5; rank++) {
-        if (rank <= simCoins.length) {
-          const sc = simCoins[rank - 1];
-          if (sc.isReal) {
-            top5ThisDraw.add(sc.mint);
-            const wMap = winCounts[rank];
-            wMap.set(sc.mint, (wMap.get(sc.mint) || 0) + 1);
-          }
-          // Size bins for this place
-          const sz = sc.size;
-          let binIdx = 0;
-          for (let b = 0; b < sizeEdges.length; b++) {
-            if (sz >= sizeEdges[b]) {
-              binIdx = b + 1; // 1-based index corresponding to edges
-            }
-          }
-          if (binIdx > 0) {
-            const bCounts = sizeBinCounts[rank];
-            bCounts[binIdx] = (bCounts[binIdx] || 0) + 1;
-          }
+  // Populate all historical observations for candidates from all marks
+  for (const m of marks) {
+    for (const r of m.rows) {
+      const cand = candidateMap.get(r.mint);
+      if (cand) {
+        // Check if observation already exists for this timeHours
+        if (!cand.obs.some((o) => Math.abs(o.timeHours - m.timeHours) < 1e-5)) {
+          cand.obs.push({ timeHours: m.timeHours, size: sizeOf(r.market_cap_lamports) });
         }
       }
-
-      for (const mint of top5ThisDraw) {
-        top5Counts.set(mint, (top5Counts.get(mint) || 0) + 1);
-      }
     }
   }
 
-  // --- Emission (before calibration) ---
-  const rawProbRows: ForecastRow[] = [];
-  for (let place = 1; place <= 5; place++) {
-    const wMap = winCounts[place];
-    const placeArr: { mint: string; frac: number }[] = [];
-    for (const [mint, count] of wMap.entries()) {
-      const frac = count / totalDraws;
-      if (frac >= 0.008) {
-        placeArr.push({ mint, frac });
+  // Precompute trend for each candidate
+  const candidateProcessed = Array.from(candidateMap.values()).map((cand) => {
+    cand.obs.sort((a, b) => a.timeHours - b.timeHours);
+    let trend = 0;
+    const nObs = cand.obs.length;
+    if (nObs >= 2) {
+      let sumT = 0, sumS = 0, sumTS = 0, sumTT = 0;
+      for (const o of cand.obs) {
+        sumT += o.timeHours;
+        sumS += o.size;
+        sumTS += o.timeHours * o.size;
+        sumTT += o.timeHours * o.timeHours;
+      }
+      const denom = nObs * sumTT - sumT * sumT;
+      if (Math.abs(denom) > 1e-9) {
+        const rawSlope = (nObs * sumTS - sumT * sumS) / denom;
+        trend = clamp(rawSlope, -TREND_SLOPE_CAP, TREND_SLOPE_CAP);
       }
     }
-    // Sort highest first, take at most 24 rows per place
-    placeArr.sort((a, b) => b.frac - a.frac);
-    const top24 = placeArr.slice(0, 24);
-    for (const item of top24) {
-      rawProbRows.push({
-        place,
-        mint: item.mint,
-        p: Number(item.frac.toFixed(6)),
-      });
-    }
-  }
-
-  const rawSizeRows: SizeRow[] = [];
-  for (let place = 1; place <= 5; place++) {
-    const bCounts = sizeBinCounts[place];
-    for (const [binStr, count] of Object.entries(bCounts)) {
-      const bin = Number(binStr);
-      const frac = count / totalDraws;
-      if (frac >= 0.002) {
-        rawSizeRows.push({
-          place,
-          bin,
-          p: Number(frac.toFixed(6)),
-        });
-      }
-    }
-  }
-
-  // --- top5 computation (from RAW pooled counts, unaffected by calibration) ---
-  // score(mint) = pooled P(in top 5) + 0.06 if the mint is in the last mark's top 5
-  const lastTop5Set = new Set(lastMark.rows.filter(r => r.rank <= 5).map(r => r.mint));
-  const candidateScores = new Map<string, number>();
-
-  // Candidates = all mints with a top-5 count plus the last mark's top 5
-  const allTop5Mints = new Set<string>();
-  for (const mint of top5Counts.keys()) allTop5Mints.add(mint);
-  for (const mint of lastTop5Set) allTop5Mints.add(mint);
-
-  for (const mint of allTop5Mints) {
-    const top5Frac = (top5Counts.get(mint) || 0) / totalDraws;
-    const bonus = lastTop5Set.has(mint) ? 0.06 : 0;
-    candidateScores.set(mint, top5Frac + bonus);
-  }
-
-  // Sort candidates by score descending, take best 5
-  let sortedTop5 = Array.from(candidateScores.entries())
-    .sort((a, b) => b[1] - a[1])
-    .map(entry => entry[0]);
-
-  if (sortedTop5.length < 5) {
-    // Pad from last mark's order
-    for (const r of lastMark.rows) {
-      if (!sortedTop5.includes(r.mint)) {
-        sortedTop5.push(r.mint);
-      }
-      if (sortedTop5.length >= 5) break;
-    }
-  }
-
-  const top5Selected = sortedTop5.slice(0, 5);
-
-  // Then order the selected 5 by adjusted place
-  // adjusted place = 0.6 * (win-weighted mean place) + 0.4 * min(lastMarkRank, 8)
-  const top5Ordered = top5Selected.sort((aMint, bMint) => {
-    function getAdjPlace(mint: string): number {
-      let sumPlacePr = 0;
-      let totalPr = 0;
-      for (let place = 1; place <= 5; place++) {
-        const c = winCounts[place].get(mint) || 0;
-        const pr = c / totalDraws;
-        sumPlacePr += place * pr;
-        totalPr += pr;
-      }
-      const meanPlace = totalPr > 0 ? sumPlacePr / totalPr : 6; // default places + 1 = 6
-
-      const rRow = lastMark.rows.find(r => r.mint === mint);
-      const lastRank = rRow ? rRow.rank : 8;
-
-      return 0.6 * meanPlace + 0.4 * Math.min(lastRank, 8);
-    }
-
-    const scoreA = getAdjPlace(aMint);
-    const scoreB = getAdjPlace(bMint);
-    if (Math.abs(scoreA - scoreB) > 1e-6) {
-      return scoreA - scoreB;
-    }
-    return aMint.localeCompare(bMint);
+    const weight = Math.min(TREND_MAX_WEIGHT, nObs / (nObs + 8));
+    const sigma_i = Math.max(
+      SIGMA_FLOOR,
+      baseSigma * bandMult(cand.lastRank) * venueMult * (cand.venue !== 'pool' ? CURVE_MULT : 1) * (cand.inLastMark ? 1 : STALE_MULT)
+    );
+    return { ...cand, trend, weight, sigma_i, nObs };
   });
 
-  // --- CALIBRATION LAYER ---
-  /**
-   * Calibration layer (v3): final shipped implementation achieved walk-forward mean total -36.834 versus v2 -39.455, improving at every cut; final-scale run takes 7.605s of the 300s budget and keeps every named sum <= 1.
-   */
+  const lastPlace5Row = lastMark.rows[4] ?? lastMark.rows[lastMark.rows.length - 1];
+  const lastPlace5Size = lastPlace5Row ? sizeOf(lastPlace5Row.market_cap_lamports) : 0;
+  const edges = task.size.edges;
 
-  // 1. Place-kernel smoothing, probabilities only, SMOOTH_W = 0.25 (place-kernel smoothing width, sits mid-plateau of grid search 0.18-0.40)
-  const SMOOTH_W = 0.25;
+  // Aggregators for output
+  // winCounts[place][mint] = count
+  const winCounts: Array<Map<string, number>> = Array.from({ length: task.places + 1 }, () => new Map());
+  // top5Counts.set(mint, count)
+  const top5Counts = new Map<string, number>();
+  const totalPlaceSums: Array<number[]> = Array.from({ length: task.places + 1 }, () => Array(edges.length + 1).fill(0));
+  const totalDraws = task.reads.length * DRAWS;
 
-  function applyPlaceKernelSmoothing(rows: ForecastRow[], w: number): ForecastRow[] {
-    const mintMap = new Map<string, number[]>(); // mint -> p[1..5]
-    for (const r of rows) {
-      if (!mintMap.has(r.mint)) {
-        mintMap.set(r.mint, [0, 0, 0, 0, 0, 0]); // index 0 unused, 1..5
+  const rng = createRng(SEED);
+
+  // 3. Simulation per read
+  for (const readStr of task.reads) {
+    const readTime = new Date(readStr).getTime();
+    const h = Math.max(0.05, (readTime - new Date(lastMark.at).getTime()) / 3600000);
+    const hEff = DRIFT_TAU_H * (1 - Math.exp(-h / DRIFT_TAU_H));
+    const shareVal = fitShare(h);
+    const lambda = Math.min(8, (5 * shareVal) / Math.max(0.05, 1 - shareVal));
+
+    for (let d = 0; d < DRAWS; d++) {
+      const market = rng.normal(0, sigmaM * Math.sqrt(h));
+      const simulatedDraws: Array<{ mint: string | null; size: number; isPhantom: boolean }> = [];
+
+      for (const cand of candidateProcessed) {
+        const mu = cand.lastSize + g * hEff + cand.weight * cand.trend * hEff;
+        const sizeDraw = mu + market + rng.normal(0, cand.sigma_i * Math.sqrt(h));
+        simulatedDraws.push({ mint: cand.mint, size: sizeDraw, isPhantom: false });
       }
-      mintMap.get(r.mint)![r.place] = r.p;
-    }
 
-    const smoothedRows: ForecastRow[] = [];
-    for (const [mint, pArr] of mintMap.entries()) {
-      const newP = [0, 0, 0, 0, 0, 0];
-      for (let k = 1; k <= 5; k++) {
-        const pPrev = k > 1 ? pArr[k - 1] : 0;
-        const pCurr = pArr[k];
-        const pNext = k < 5 ? pArr[k + 1] : 0;
-        newP[k] = (1 - 2 * w) * pCurr + w * pPrev + w * pNext;
+      // Phantoms
+      const phantomCount = rng.poisson(lambda);
+      for (let p = 0; p < phantomCount; p++) {
+        const phantomSize = lastPlace5Size + (placeDrift[5] ?? 0) * hEff + rng.normal(entrantOffsetMean, entrantOffsetSd);
+        simulatedDraws.push({ mint: null, size: phantomSize, isPhantom: true });
       }
-      for (let k = 1; k <= 5; k++) {
-        if (newP[k] >= 1e-6) {
-          smoothedRows.push({
-            place: k,
-            mint,
-            p: Number(newP[k].toFixed(6)),
-          });
+
+      simulatedDraws.sort((a, b) => b.size - a.size);
+
+      const top5MintsInDraw = new Set<string>();
+      for (let place = 1; place <= task.places; place++) {
+        const drawItem = simulatedDraws[place - 1];
+        if (!drawItem) break;
+
+        if (!drawItem.isPhantom && drawItem.mint) {
+          const map = winCounts[place]!;
+          map.set(drawItem.mint, (map.get(drawItem.mint) ?? 0) + 1);
+          if (place <= 5) top5MintsInDraw.add(drawItem.mint);
         }
+
+        // Size histogram
+        const sz = drawItem.size;
+        let bin = 0;
+        while (bin < edges.length && sz >= edges[bin]!) {
+          bin++;
+        }
+        totalPlaceSums[place]![bin]!++;
+      }
+
+      for (const m of top5MintsInDraw) {
+        top5Counts.set(m, (top5Counts.get(m) ?? 0) + 1);
       }
     }
-    return smoothedRows;
   }
 
-  // 2. Temperature flattening, probabilities per place, ORDER_TEMP = 0.8 (probability temperature flattening, sits mid-plateau of grid search 0.75-0.90)
-  // 3. Temperature flattening, sizes per place, SIZE_TEMP = 0.8 (size temperature flattening, sits mid-plateau of grid search 0.75-0.90)
-  const ORDER_TEMP = 0.8;
-  const SIZE_TEMP = 0.8;
-
-  function applyTemperatureFlattening(
-    rows: (ForecastRow | SizeRow)[],
-    temp: number,
-    isSize: boolean
-  ): (ForecastRow | SizeRow)[] {
-    // Group by place
-    const byPlace = new Map<number, (ForecastRow | SizeRow)[]>();
-    for (const r of rows) {
-      if (!byPlace.has(r.place)) byPlace.set(r.place, []);
-      byPlace.get(r.place)!.push(r);
-    }
-
-    const result: (ForecastRow | SizeRow)[] = [];
-
-    for (let place = 1; place <= 5; place++) {
-      const pRows = byPlace.get(place);
-      if (!pRows || pRows.length === 0) continue;
-
-      const oldSum = pRows.reduce((sum, r) => sum + r.p, 0);
-      if (oldSum <= 0) continue;
-
-      const transformed = pRows.map(r => ({
-        ...r,
-        val: Math.pow(r.p, temp),
-      }));
-
-      const transSum = transformed.reduce((sum, r) => sum + r.val, 0);
-      if (transSum <= 0) continue;
-
-      const scale = oldSum / transSum;
-
-      for (const t of transformed) {
-        const q = t.val * scale;
-        const threshold = isSize ? 1e-6 : 1e-6;
-        if (q >= threshold) {
-          const entry: any = {
-            place: t.place,
-            p: Number(q.toFixed(6)),
-          };
-          if (isSize) {
-            entry.bin = (t as SizeRow).bin;
-          } else {
-            entry.mint = (t as ForecastRow).mint;
-          }
-          result.push(entry);
-        }
+  // 4. Output Construction
+  const probabilities: Array<{ mint: string; place: number; p: number }> = [];
+  for (let place = 1; place <= task.places; place++) {
+    const map = winCounts[place]!;
+    const placeRows: Array<{ mint: string; p: number }> = [];
+    for (const [mint, count] of map.entries()) {
+      const p = count / totalDraws;
+      if (p >= EMIT_MIN_P) {
+        placeRows.push({ mint, p });
       }
     }
-
-    return result;
+    placeRows.sort((a, b) => b.p - a.p);
+    const topRows = placeRows.slice(0, MAX_ROWS_PER_PLACE);
+    for (const r of topRows) {
+      probabilities.push({ mint: r.mint, place, p: Number(r.p.toFixed(6)) });
+    }
   }
 
-  // Apply calibration steps
-  // Rationale: the raw Monte Carlo place assignment is overconfident - membership in the top 5 is more predictable than the exact place, and both the coin and size distributions are too sharp exactly when pair evidence is thin; the kernel borrows mass across neighbouring places and the temperature flattens each place toward its own named set, preserving named sums.
-  const smoothedProbs = applyPlaceKernelSmoothing(rawProbRows, SMOOTH_W);
-  const calibratedProbs = applyTemperatureFlattening(smoothedProbs, ORDER_TEMP, false) as ForecastRow[];
-  const calibratedSizes = applyTemperatureFlattening(rawSizeRows, SIZE_TEMP, true) as SizeRow[];
+  const sizes: Array<{ place: number; bin: number; p: number }> = [];
+  for (let place = 1; place <= task.places; place++) {
+    const bins = totalPlaceSums[place]!;
+    for (let bin = 0; bin <= edges.length; bin++) {
+      const count = bins[bin] ?? 0;
+      const p = count / totalDraws;
+      if (p >= EMIT_MIN_SIZE_P) {
+        sizes.push({ place, bin, p: Number(p.toFixed(6)) });
+      }
+    }
+  }
 
-  const finalOutput: ForecastOutput = {
-    probabilities: calibratedProbs,
-    sizes: calibratedSizes,
-    top5: top5Ordered,
-  };
+  // Compute mean place and place-1 share for candidate ranking
+  const meanPlaceMap = new Map<string, number>();
+  const place1ShareMap = new Map<string, number>();
+  for (let place = 1; place <= task.places; place++) {
+    const map = winCounts[place]!;
+    for (const [mint, count] of map.entries()) {
+      const p = count / totalDraws;
+      meanPlaceMap.set(mint, (meanPlaceMap.get(mint) ?? 0) + place * p);
+      if (place === 1) place1ShareMap.set(mint, p);
+    }
+  }
 
-  const outputPath = path.join(outputDir, task.output);
-  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-  fs.writeFileSync(outputPath, JSON.stringify(finalOutput, null, 2), 'utf-8');
+  // Last mark top 5 rank map
+  const lastMarkTop5Set = new Set<string>();
+  const lastMarkRankMap = new Map<string, number>();
+  for (const r of lastMark.rows) {
+    lastMarkRankMap.set(r.mint, r.rank);
+    if (r.rank <= 5) lastMarkTop5Set.add(r.mint);
+  }
+
+  const allCandidateMints = Array.from(new Set([...top5Counts.keys(), ...lastMarkTop5Set]));
+
+  // Selection score: pooled P(in top 5) + incumbent bonus if in last mark top 5
+  const scoredCandidates = allCandidateMints.map((mint) => {
+    const pTop5 = (top5Counts.get(mint) ?? 0) / totalDraws;
+    const isIncumbent = lastMarkTop5Set.has(mint) ? 1 : 0;
+    const score = pTop5 + isIncumbent * TOP5_INCUMBENT_BONUS;
+    return { mint, score };
+  });
+
+  scoredCandidates.sort((a, b) => b.score - a.score);
+  const selectedTop5 = scoredCandidates.slice(0, task.places).map((c) => c.mint);
+
+  // Pad from last mark if fewer than 5
+  for (const r of lastMark.rows) {
+    if (selectedTop5.length < task.places && !selectedTop5.includes(r.mint)) {
+      selectedTop5.push(r.mint);
+    }
+  }
+
+  // Ordering of selected 5 by adjusted place = 0.6 * win-weighted mean place + 0.4 * min(lastMarkRank, 8)
+  selectedTop5.sort((a, b) => {
+    const winMeanPlaceA = (meanPlaceMap.get(a) ?? (task.places + 1));
+    const winMeanPlaceB = (meanPlaceMap.get(b) ?? (task.places + 1));
+    const rankA = lastMarkRankMap.get(a) ?? 8;
+    const rankB = lastMarkRankMap.get(b) ?? 8;
+    const adjA = 0.6 * winMeanPlaceA + 0.4 * Math.min(rankA, 8);
+    const adjB = 0.6 * winMeanPlaceB + 0.4 * Math.min(rankB, 8);
+    if (Math.abs(adjA - adjB) > 1e-5) return adjA - adjB;
+    return a.localeCompare(b);
+  });
+
+  const top5: string[] = selectedTop5;
+
+  writeFileSync(join(OUTPUT_DIR, task.output), `${JSON.stringify({ probabilities, top5, sizes })}\n`);
 }
 
-// --- Persistence Fallback ---
-function emitFallback(task: Task | undefined, marks: Mark[], outputDir: string) {
-  const outPath = task ? path.join(outputDir, task.output) : path.join(outputDir, 'forecast.json');
-  const places = task ? task.places : 5;
-  const sizeEdges = task && task.size && task.size.edges ? task.size.edges : [-1, 0, 1, 2, 3, 4, 5];
-
-  const lastChartRows = marks.length > 0 && marks[marks.length - 1].rows ? marks[marks.length - 1].rows : [];
-
-  const probabilities: ForecastRow[] = [];
-  const sizes: SizeRow[] = [];
-  const top5: string[] = [];
-
-  for (let k = 1; k <= places; k++) {
-    const row = lastChartRows.find(r => r.rank === k);
-    if (row) {
-      top5.push(row.mint);
-      // 0.30 on #k, 0.10 on #k-1 and #k+1
-      probabilities.push({ place: k, mint: row.mint, p: 0.30 });
-      const prevRow = lastChartRows.find(r => r.rank === k - 1);
-      if (prevRow) {
-        probabilities.push({ place: k, mint: prevRow.mint, p: 0.10 });
-      }
-      const nextRow = lastChartRows.find(r => r.rank === k + 1);
-      if (nextRow) {
-        probabilities.push({ place: k, mint: nextRow.mint, p: 0.10 });
-      }
-
-      // Sizes: normal distribution sd 0.35 around size of coin at #k
-      const meanSize = (() => {
-        try {
-          const bi = BigInt(row.lamports);
-          return bi > 0n ? Math.log10(Number(bi)) - 9 : 0;
-        } catch (e) {
-          const n = Number(row.lamports);
-          return isNaN(n) || n <= 0 ? 0 : Math.log10(n) - 9;
-        }
-      })();
-
-      // Bin probabilities via erfc/normal CDF
-      for (let bIdx = 0; bIdx < sizeEdges.length; bIdx++) {
-        const edge = sizeEdges[bIdx];
-        const nextEdge = bIdx + 1 < sizeEdges.length ? sizeEdges[bIdx + 1] : edge + 2;
-        const prob = normalCDF(nextEdge, meanSize, 0.35) - normalCDF(edge, meanSize, 0.35);
-        const pFloored = Number(prob.toFixed(6));
-        if (pFloored > 0) {
-          sizes.push({ place: k, bin: bIdx + 1, p: pFloored });
-        }
-      }
-    }
+try {
+  main();
+} catch (err) {
+  try {
+    const task = JSON.parse(readFileSync(join(INPUT_DIR, 'task.json'), 'utf8'));
+    const lines = readFileSync(join(INPUT_DIR, 'history.ndjson'), 'utf8').split('\n').filter((l) => l.trim() !== '');
+    const marks = lines.map((l) => JSON.parse(l)).filter((m: any) => m.ok && Array.isArray(m.rows));
+    writePersistenceFallback(task, marks);
+  } catch {
+    // Ultimate fallback if even task.json fails to read
   }
-
-  // If top5 not filled
-  for (const r of lastChartRows) {
-    if (top5.length < 5 && !top5.includes(r.mint)) {
-      top5.push(r.mint);
-    }
-  }
-
-  const fallbackOutput: ForecastOutput = {
-    probabilities,
-    sizes,
-    top5: top5.slice(0, 5),
-  };
-
-  fs.mkdirSync(path.dirname(outPath), { recursive: true });
-  fs.writeFileSync(outPath, JSON.stringify(fallbackOutput, null, 2), 'utf-8');
 }
-
-main().catch(() => {
-  // Never crash unhandled
-});
